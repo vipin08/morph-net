@@ -23,7 +23,7 @@ NUM_CHANNELS = 3
 
 class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
 
-  def BuildWithBatchNorm(self, fused):
+  def BuildWithBatchNorm(self, fused, inputs):
     params = {
         'trainable': True,
         'normalizer_fn': slim.batch_norm,
@@ -34,11 +34,11 @@ class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
     }
 
     with slim.arg_scope([slim.layers.conv2d], **params):
-      self.BuildModel()
+      self.BuildModel(inputs=inputs)
     with self.cached_session():
       self.Init()
 
-  def BuildModel(self):
+  def BuildModel(self, inputs):
     # Our test model is:
     #
     #         -> conv1 --+     -> conv3 -->
@@ -49,7 +49,10 @@ class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
     #
     # (the model has two "outputs", conv3 and conv4).
     #
+
+    # op.name: 'Const'
     image = tf.constant(0.0, shape=[1, 17, 19, NUM_CHANNELS])
+    # op.name: 'conv1/Conv2D'
     conv1 = slim.layers.conv2d(image, 13, [7, 5], padding='SAME', scope='conv1')
     conv2 = slim.layers.conv2d(image, 23, [1, 1], padding='SAME', scope='conv2')
     concat = tf.concat([conv1, conv2], 3)
@@ -58,9 +61,8 @@ class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
     self.conv4 = slim.layers.conv2d(
         concat, 31, [1, 1], stride=1, padding='SAME', scope='conv4')
     self.name_to_var = {v.op.name: v for v in tf.global_variables()}
-
     self.gamma_flop_reg = flop_regularizer.GammaFlopsRegularizer(
-        [self.conv3.op, self.conv4.op], gamma_threshold=0.45)
+        [self.conv3.op, self.conv4.op], gamma_threshold=0.45, inputs=inputs)
 
   def GetConv(self, name):
     return tf.get_default_graph().get_operation_by_name(name + '/Conv2D')
@@ -84,8 +86,16 @@ class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
     with self.cached_session():
       return self.gamma_flop_reg.get_regularization_term(conv).eval()
 
-  def testCost(self,):
-    self.BuildWithBatchNorm(fused=True)
+  def GetSourceOps(self):
+    op_regularizer_manager = self.gamma_flop_reg.op_regularizer_manager
+    return [
+        op.name
+        for op in op_regularizer_manager.ops
+        if op_regularizer_manager.is_source_op(op)
+    ]
+
+  def testCost(self):
+    self.BuildWithBatchNorm(fused=True, inputs=None)
     # Conv1 has 7 gammas above 0.45, and NUM_CHANNELS inputs (from the image).
     conv = self.GetConv('conv1')
     self.assertEqual(_coeff(conv) * 7 * NUM_CHANNELS, self.GetCost([conv]))
@@ -107,8 +117,28 @@ class GammaFlopLossTest(parameterized.TestCase, tf.test.TestCase):
     self.assertEqual(
         self.GetCost(convs[:1]) + self.GetCost(convs[1:]), self.GetCost(convs))
 
+  @parameterized.parameters(
+      # Don't block any paths.
+      (None, [
+          'conv1/BatchNorm/FusedBatchNorm', 'conv2/BatchNorm/FusedBatchNorm',
+          'conv3/BatchNorm/FusedBatchNorm', 'conv4/BatchNorm/FusedBatchNorm'
+      ]),
+      # Only block one path, can still reach all other convolutions.
+      (['conv3/'], [
+          'conv1/BatchNorm/FusedBatchNorm', 'conv2/BatchNorm/FusedBatchNorm',
+          'conv4/BatchNorm/FusedBatchNorm'
+      ]),
+      # Block both paths, can no longer reach Concat and earlier convolutions.
+      (['conv(3|4)/BatchNorm/FusedBatchNorm'], []),
+      # Block concat, can only see conv3 and conv4.
+      (['concat'
+       ], ['conv3/BatchNorm/FusedBatchNorm', 'conv4/BatchNorm/FusedBatchNorm']))
+  def testOpsDetected(self, inputs, expected):
+    self.BuildWithBatchNorm(fused=True, inputs=inputs)
+    self.assertCountEqual(self.GetSourceOps(), expected)
+
   def testLossDecorated(self):
-    self.BuildWithBatchNorm(True)
+    self.BuildWithBatchNorm(True, inputs=None)
     # Create network regularizer with DummyDecorator op regularization.
     self.gamma_flop_reg = flop_regularizer.GammaFlopsRegularizer(
         [self.conv3.op, self.conv4.op],
